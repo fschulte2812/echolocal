@@ -1,7 +1,9 @@
 package bluetooth
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/ygelfand/echolocal/internal/hardware/ble"
@@ -43,6 +45,17 @@ func TestGATTError(t *testing.T) {
 	}
 	if got := gattError(errors.New("timeout")); got != errGATT {
 		t.Errorf("other = %#x", got)
+	}
+}
+
+func TestBondRejected(t *testing.T) {
+	if !bondRejected(fmt.Errorf("encrypting: %w", ble.StatusError(statusKeyMissing))) {
+		t.Error("key missing should pair again")
+	}
+	for _, err := range []error{context.DeadlineExceeded, ble.ErrClosed, ble.StatusError(0x08), errors.New("hci")} {
+		if bondRejected(err) {
+			t.Errorf("%v should keep the bond", err)
+		}
 	}
 }
 

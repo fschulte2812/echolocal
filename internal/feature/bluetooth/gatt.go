@@ -26,6 +26,9 @@ const connectAttempts = 3
 // statusFailedToEstablish is the HCI status of a link that came up but never carried a packet.
 const statusFailedToEstablish = 0x3E
 
+// statusKeyMissing is the HCI status of an encryption the device refused for want of the keys.
+const statusKeyMissing = 0x06
+
 // connectTimeout bounds one request. Home Assistant gives up on its own side at about the same time
 // and asks again.
 const connectTimeout = 20 * time.Second
@@ -66,6 +69,10 @@ type slot struct {
 // opsQueued is how many operations may wait on one link. Home Assistant waits for each answer
 // except writes without response, so this only fills with a burst of those.
 const opsQueued = 256
+
+// notesQueued is how many notifications may wait for Home Assistant on one link before they are
+// dropped.
+const notesQueued = 256
 
 // queue runs op on the link's queue, or straight away when there is no link, which op reports.
 func (g *gatt) queue(address uint64, op func()) {
@@ -228,15 +235,31 @@ func (g *gatt) dial(ctx context.Context, s *slot, address uint64, addrType uint8
 		}
 	})
 
+	// Notifications go out in the order the device sent them, from one sender: a value split across
+	// notifications is only a value if the parts arrive in order.
+	notes := make(chan *api.BluetoothGATTNotifyDataResponse, notesQueued)
+	go func() {
+		for {
+			select {
+			case n := <-notes:
+				_ = s.api.Send(n)
+			case <-link.Done():
+				return
+			}
+		}
+	}()
 	link.OnNotify(func(handle uint16, data []byte) {
 		g.mu.Lock()
 		on := s.notify[handle]
 		g.mu.Unlock()
-		if on {
-			// On the radio's reader: a slow client costs a notification, never the reader.
-			go func() {
-				_ = s.api.Send(&api.BluetoothGATTNotifyDataResponse{Address: address, Handle: uint32(handle), Data: data})
-			}()
+		if !on {
+			return
+		}
+		// On the radio's reader: a slow client costs a notification, never the reader.
+		select {
+		case notes <- &api.BluetoothGATTNotifyDataResponse{Address: address, Handle: uint32(handle), Data: data}:
+		default:
+			slog.Debug("ble notification dropped, Home Assistant is behind", "address", mac(address), "handle", handle)
 		}
 	})
 
@@ -309,6 +332,10 @@ func (g *gatt) secure(link *ble.Conn, address uint64) error {
 		if err == nil {
 			return nil
 		}
+		if !bondRejected(err) {
+			// A timeout or a dropped link says nothing about the keys: keep them for the next try.
+			return err
+		}
 		// The device forgot the bond, or was reset: pair again.
 		slog.Info("ble bond not accepted, pairing again", "address", mac(address), "err", err)
 		_ = g.bonds.remove(address)
@@ -321,6 +348,13 @@ func (g *gatt) secure(link *ble.Conn, address uint64) error {
 		slog.Warn("ble keys could not be saved; the device will need pairing again", "err", err)
 	}
 	return nil
+}
+
+// bondRejected reports whether encrypting failed because the device no longer has the keys, which
+// it says by answering the encryption request with PIN or Key Missing.
+func bondRejected(err error) bool {
+	var status ble.StatusError
+	return errors.As(err, &status) && status == statusKeyMissing
 }
 
 // pairingError is the reason Home Assistant is told why pairing failed.
