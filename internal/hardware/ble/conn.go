@@ -74,6 +74,7 @@ type Conn struct {
 	rx  []byte
 
 	att *att
+	sec security
 }
 
 // Addr is the peer's address as a big-endian integer.
@@ -196,6 +197,7 @@ func (l *links) add(r *Radio, p []byte, addrType uint8) *Conn {
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.att = newATT(c)
+	c.sec.encrypted = make(chan uint8, 1)
 
 	l.mu.Lock()
 	l.byHandle[c.Handle] = c
@@ -364,16 +366,5 @@ func (c *Conn) signal(p []byte) {
 	default:
 		// Command Reject: not understood.
 		c.reply(cidSignaling, []byte{0x01, id, 0x02, 0x00, 0x00, 0x00})
-	}
-}
-
-// smp declines pairing: there is nowhere to keep keys, and Home Assistant has not asked for it.
-func (c *Conn) smp(p []byte) {
-	if len(p) == 0 {
-		return
-	}
-	switch p[0] {
-	case 0x01, 0x0B: // Pairing Request, Security Request
-		c.reply(cidSMP, []byte{0x05, 0x05}) // Pairing Failed: pairing not supported
 	}
 }

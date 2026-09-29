@@ -22,6 +22,7 @@ const (
 	cmdDisconnect          = 0x0406
 	cmdReset               = 0x0C03
 	cmdReadBufferSize      = 0x1005
+	cmdReadBDAddr          = 0x1009
 	cmdLEReadBufferSize    = 0x2002
 	cmdLEAdvertisingParams = 0x2006
 	cmdLEAdvertisingData   = 0x2008
@@ -31,6 +32,7 @@ const (
 	cmdLECreateConnection  = 0x200D
 	cmdLECreateCancel      = 0x200E
 	cmdLEConnectionUpdate  = 0x2013
+	cmdLEEnableEncryption  = 0x2019
 	cmdLELTKNegativeReply  = 0x201B
 	cmdLERemoteParamReply  = 0x2020
 )
@@ -98,6 +100,10 @@ type Radio struct {
 
 	acl  aclBuffers
 	link links
+
+	// address is the controller's public address, least significant octet first, which pairing
+	// mixes into its keys.
+	address [6]byte
 
 	// sink replaces the node for writes in tests, where there is no controller.
 	sink func([]byte) error
@@ -276,6 +282,14 @@ func (r *Radio) begin(scanning, active bool, advertisement []byte) error {
 	}
 	if err := r.bufferSize(); err != nil {
 		return err
+	}
+	var params []byte
+	var err error
+	if r.held, params, err = command(r.fd, r.held, cmdReadBDAddr, nil); err != nil {
+		return fmt.Errorf("ble: reading the controller's address: %w", err)
+	}
+	if len(params) >= 6 {
+		copy(r.address[:], params[:6])
 	}
 	// This MTK controller can scan and advertise together, but only when scanning is enabled first.
 	// Enabling advertising first leaves the subsequent scan command waiting indefinitely.
@@ -508,6 +522,14 @@ func (r *Radio) dispatch(pkt []byte) {
 		r.commandEvent(pkt)
 	case evtNumCompletedPackets:
 		r.acl.completed(pkt[3:])
+	case evtEncryptionChange, evtKeyRefreshComplete:
+		if len(pkt) >= 6 {
+			status := pkt[3]
+			if pkt[1] == evtEncryptionChange && status == 0 && len(pkt) >= 7 && pkt[6] == 0 {
+				status = statusConnectionFailed // the link came out unencrypted
+			}
+			r.link.encryption(binary.LittleEndian.Uint16(pkt[4:])&0x0fff, status)
+		}
 	case evtDisconnectionComplete:
 		if len(pkt) >= 7 {
 			handle := binary.LittleEndian.Uint16(pkt[4:]) & 0x0fff

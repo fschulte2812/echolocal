@@ -21,6 +21,13 @@ type peripheral struct {
 	queued  []byte
 	attrs   []attr
 	notify  chan struct{}
+
+	// smp and encrypt, when set, play the device's side of pairing.
+	smp     func(pdu []byte)
+	encrypt func(params []byte) byte
+	// afterEncrypt is what the device says once the link is encrypted, on the controller's goroutine
+	// as everything it says has to be.
+	afterEncrypt func()
 }
 
 type attr struct {
@@ -94,8 +101,11 @@ func (p *peripheral) run() {
 				p.rx = append(p.rx[:0], pkt[5:]...)
 			}
 			if len(p.rx) >= 4 && len(p.rx) >= 4+int(binary.LittleEndian.Uint16(p.rx)) {
-				if cid := binary.LittleEndian.Uint16(p.rx[2:]); cid == cidATT {
+				switch cid := binary.LittleEndian.Uint16(p.rx[2:]); {
+				case cid == cidATT:
 					p.att(p.rx[4:])
+				case cid == cidSMP && p.smp != nil:
+					p.smp(p.rx[4:])
 				}
 				p.rx = nil
 			}
@@ -116,12 +126,32 @@ func (p *peripheral) command(opcode uint16, params []byte) {
 		complete = append(complete, params[6:12]...)
 		complete = append(complete, 0x28, 0, 0, 0, 0x90, 0x01, 0)
 		p.event(evtLEMeta, complete...)
+	case cmdLEEnableEncryption:
+		p.event(evtCommandStatus, 0, 1, byte(opcode), byte(opcode>>8))
+		status := byte(0x06) // PIN or key missing
+		if p.encrypt != nil {
+			status = p.encrypt(params)
+		}
+		p.event(evtEncryptionChange, status, params[0], params[1], 1)
+		if f := p.afterEncrypt; f != nil {
+			p.afterEncrypt = nil
+			f()
+		}
 	case cmdDisconnect:
 		p.event(evtCommandStatus, 0, 1, byte(opcode), byte(opcode>>8))
 		p.event(evtDisconnectionComplete, 0, params[0], params[1], 0x16)
 	default:
 		p.event(evtCommandComplete, 1, byte(opcode), byte(opcode>>8), 0)
 	}
+}
+
+// sendOn is the peripheral talking on any fixed channel.
+func (p *peripheral) sendOn(cid uint16, pdu []byte) {
+	frame := append(u16(uint16(len(pdu))), u16(cid)...)
+	frame = append(frame, pdu...)
+	pkt := append([]byte{h4ACL}, u16(0x0040|pbFirstFlushable)...)
+	pkt = append(pkt, u16(uint16(len(frame)))...)
+	p.r.dispatch(append(pkt, frame...))
 }
 
 // send is the peripheral talking: one L2CAP frame, cut into ACL packets marked as the controller does.

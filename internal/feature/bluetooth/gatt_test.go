@@ -54,3 +54,46 @@ func TestFreeSlots(t *testing.T) {
 		t.Errorf("free = %v", r)
 	}
 }
+
+func TestBonds(t *testing.T) {
+	b := &bonds{path: t.TempDir() + "/bonds.json"}
+	if _, ok := b.get(1); ok {
+		t.Fatal("bond before pairing")
+	}
+	k := ble.Keys{LTK: [16]byte{1, 2, 3}, EDIV: 7, Size: 16, Secure: true}
+	if err := b.put(0x847293478240, k); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := b.get(0x847293478240)
+	if !ok || got != k {
+		t.Fatalf("bond = %+v %v", got, ok)
+	}
+	if err := b.remove(0x847293478240); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := b.get(0x847293478240); ok {
+		t.Error("bond after removing it")
+	}
+}
+
+func TestWorkKeepsOrder(t *testing.T) {
+	ops := make(chan func(), opsQueued)
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() { work(ops, done); close(finished) }()
+
+	var got []int
+	for i := range 100 {
+		ops <- func() { got = append(got, i) }
+	}
+	close(done)
+	<-finished
+	for i, v := range got {
+		if v != i {
+			t.Fatalf("operation %d ran as %d", v, i)
+		}
+	}
+	if len(got) != 100 {
+		t.Errorf("ran %d of 100", len(got))
+	}
+}

@@ -42,6 +42,7 @@ const (
 const bluetoothFeatures = esphome.BluetoothPassiveScan |
 	esphome.BluetoothActiveConnections |
 	esphome.BluetoothRemoteCaching |
+	esphome.BluetoothPairing |
 	esphome.BluetoothCacheClearing |
 	esphome.BluetoothRawAdvertisements |
 	esphome.BluetoothStateAndMode

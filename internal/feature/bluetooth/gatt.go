@@ -44,6 +44,7 @@ const (
 // notifications.
 type gatt struct {
 	radio *ble.Radio
+	bonds *bonds
 
 	mu    sync.Mutex
 	slots map[uint64]*slot
@@ -57,9 +58,52 @@ type slot struct {
 	link   *ble.Conn
 	// notify is the handles Home Assistant subscribed to.
 	notify map[uint16]bool
+	// ops runs the link's GATT operations one at a time, in the order Home Assistant sent them: a
+	// value written in chunks without response is only a value if the chunks arrive in order.
+	ops chan func()
 }
 
-func newGATT(radio *ble.Radio) *gatt { return &gatt{radio: radio, slots: map[uint64]*slot{}} }
+// opsQueued is how many operations may wait on one link. Home Assistant waits for each answer
+// except writes without response, so this only fills with a burst of those.
+const opsQueued = 256
+
+// queue runs op on the link's queue, or straight away when there is no link, which op reports.
+func (g *gatt) queue(address uint64, op func()) {
+	g.mu.Lock()
+	var ops chan func()
+	if s := g.slots[address]; s != nil {
+		ops = s.ops
+	}
+	g.mu.Unlock()
+	if ops == nil {
+		go op()
+		return
+	}
+	ops <- op
+}
+
+// work runs a link's operations until it goes, and then the ones still queued, which report it gone.
+func work(ops chan func(), done <-chan struct{}) {
+	for {
+		select {
+		case op := <-ops:
+			op()
+		case <-done:
+			for {
+				select {
+				case op := <-ops:
+					op()
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func newGATT(radio *ble.Radio) *gatt {
+	return &gatt{radio: radio, bonds: &bonds{path: bondsPath}, slots: map[uint64]*slot{}}
+}
 
 // handle answers connection and GATT messages, and reports whether msg was one.
 func (g *gatt) handle(conn *esphome.Conn, msg proto.Message) (bool, error) {
@@ -74,15 +118,15 @@ func (g *gatt) handle(conn *esphome.Conn, msg proto.Message) (bool, error) {
 		return true, g.device(conn, m)
 
 	case *api.BluetoothGATTGetServicesRequest:
-		go g.services(conn, m.GetAddress())
+		g.queue(m.GetAddress(), func() { g.services(conn, m.GetAddress()) })
 	case *api.BluetoothGATTReadRequest:
-		go g.read(conn, m.GetAddress(), m.GetHandle())
+		g.queue(m.GetAddress(), func() { g.read(conn, m.GetAddress(), m.GetHandle()) })
 	case *api.BluetoothGATTReadDescriptorRequest:
-		go g.read(conn, m.GetAddress(), m.GetHandle())
+		g.queue(m.GetAddress(), func() { g.read(conn, m.GetAddress(), m.GetHandle()) })
 	case *api.BluetoothGATTWriteRequest:
-		go g.write(conn, m.GetAddress(), m.GetHandle(), m.GetData(), m.GetResponse())
+		g.queue(m.GetAddress(), func() { g.write(conn, m.GetAddress(), m.GetHandle(), m.GetData(), m.GetResponse()) })
 	case *api.BluetoothGATTWriteDescriptorRequest:
-		go g.write(conn, m.GetAddress(), m.GetHandle(), m.GetData(), true)
+		g.queue(m.GetAddress(), func() { g.write(conn, m.GetAddress(), m.GetHandle(), m.GetData(), true) })
 	case *api.BluetoothGATTNotifyRequest:
 		return true, g.subscribe(conn, m.GetAddress(), m.GetHandle(), m.GetEnable())
 	default:
@@ -113,9 +157,12 @@ func (g *gatt) device(conn *esphome.Conn, m *api.BluetoothDeviceRequest) error {
 		return nil
 
 	case api.BluetoothDeviceRequestType_BLUETOOTH_DEVICE_REQUEST_TYPE_PAIR:
-		// Pairing needs keys kept across boots, which this proxy does not keep.
-		return conn.Send(&api.BluetoothDevicePairingResponse{Address: address, Error: errGATT})
+		g.queue(address, func() { g.pair(conn, address) })
+		return nil
 	case api.BluetoothDeviceRequestType_BLUETOOTH_DEVICE_REQUEST_TYPE_UNPAIR:
+		if err := g.bonds.remove(address); err != nil {
+			return conn.Send(&api.BluetoothDeviceUnpairingResponse{Address: address, Error: errGATT})
+		}
 		return conn.Send(&api.BluetoothDeviceUnpairingResponse{Address: address, Success: true})
 	case api.BluetoothDeviceRequestType_BLUETOOTH_DEVICE_REQUEST_TYPE_CLEAR_CACHE:
 		// Nothing is cached on this side.
@@ -173,6 +220,14 @@ func (g *gatt) dial(ctx context.Context, s *slot, address uint64, addrType uint8
 		return
 	}
 
+	// A device asks for security when a client reaches for something it only serves encrypted.
+	// ESPHome answers by securing the link, and so does this.
+	link.OnSecurityRequest(func() {
+		if err := g.secure(link, address); err != nil {
+			slog.Info("ble proxy could not secure the link the device asked for", "address", mac(address), "err", err)
+		}
+	})
+
 	link.OnNotify(func(handle uint16, data []byte) {
 		g.mu.Lock()
 		on := s.notify[handle]
@@ -187,6 +242,8 @@ func (g *gatt) dial(ctx context.Context, s *slot, address uint64, addrType uint8
 
 	g.mu.Lock()
 	s.link = link
+	s.ops = make(chan func(), opsQueued)
+	go work(s.ops, link.Done())
 	cancelled := ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded)
 	g.mu.Unlock()
 
@@ -224,6 +281,62 @@ func (g *gatt) link(address uint64) *slot {
 		return s
 	}
 	return nil
+}
+
+// pair answers Home Assistant's pairing request.
+func (g *gatt) pair(conn *esphome.Conn, address uint64) {
+	s := g.link(address)
+	if s == nil {
+		_ = conn.Send(&api.BluetoothDevicePairingResponse{Address: address, Error: errNoConnection})
+		return
+	}
+	if err := g.secure(s.link, address); err != nil {
+		slog.Info("ble proxy pairing failed", "address", mac(address), "err", err)
+		_ = conn.Send(&api.BluetoothDevicePairingResponse{Address: address, Error: pairingError(err)})
+		return
+	}
+	_ = conn.Send(&api.BluetoothDevicePairingResponse{Address: address, Paired: true})
+}
+
+// secure encrypts the link: with the keys of an earlier pairing where there are some the device
+// still accepts, by pairing afresh otherwise.
+func (g *gatt) secure(link *ble.Conn, address uint64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if k, ok := g.bonds.get(address); ok {
+		err := link.Encrypt(ctx, k)
+		if err == nil {
+			return nil
+		}
+		// The device forgot the bond, or was reset: pair again.
+		slog.Info("ble bond not accepted, pairing again", "address", mac(address), "err", err)
+		_ = g.bonds.remove(address)
+	}
+	k, err := link.Pair(ctx)
+	if err != nil {
+		return err
+	}
+	if err := g.bonds.put(address, k); err != nil {
+		slog.Warn("ble keys could not be saved; the device will need pairing again", "err", err)
+	}
+	return nil
+}
+
+// pairingError is the reason Home Assistant is told why pairing failed.
+func pairingError(err error) int32 {
+	var pe *ble.PairingError
+	if errors.As(err, &pe) {
+		return int32(pe.Reason)
+	}
+	var status ble.StatusError
+	if errors.As(err, &status) {
+		return int32(status)
+	}
+	if errors.Is(err, ble.ErrClosed) {
+		return errNoConnection
+	}
+	return errGATT
 }
 
 func (g *gatt) services(conn *esphome.Conn, address uint64) {

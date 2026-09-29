@@ -10,6 +10,8 @@ const (
 	h4Event = 0x04
 
 	evtDisconnectionComplete = 0x05
+	evtEncryptionChange      = 0x08
+	evtKeyRefreshComplete    = 0x30
 	evtCommandComplete       = 0x0E
 	evtCommandStatus         = 0x0F
 	evtNumCompletedPackets   = 0x13
